@@ -1,116 +1,121 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+from io import BytesIO
 import matplotlib.pyplot as plt
 import seaborn as sns
-from io import BytesIO
-from google import genai
-from google.genai.errors import APIError
+import numpy as np
+import warnings
 from pandas.api.types import is_numeric_dtype
-from pandas_datareader import wb
+
+# --- 1. IMPORT THƯ VIỆN BỔ SUNG CHO GEMINI AI ---
+try:
+    from google import genai
+    from google.genai.errors import APIError
+except ImportError:
+    st.error("Lỗi: Thư viện 'google-genai' chưa được cài đặt. Vui lòng chạy `pip install google-genai`.")
+    st.stop()
+    
+try:
+    from vnstock import Vnstock
+except ImportError:
+    st.error("Lỗi: Thư viện 'vnstock' chưa được cài đặt. Vui lòng chạy `pip install vnstock`.")
+    st.stop()
+
+# --- SỬA LỖI ATTRIBUTEERROR ---
+# Thay đổi cách import SettingWithCopyWarning để tương thích với Pandas mới
+try:
+    from pandas.errors import SettingWithCopyWarning
+    warnings.filterwarnings('ignore', category=SettingWithCopyWarning)
+except ImportError:
+    pass 
+except AttributeError:
+    pass
+
 
 # --- CẤU HÌNH BAN ĐẦU ---
 st.set_page_config(
-    page_title="Phân Tích Dữ Liệu Kinh Tế Vĩ Mô Việt Nam",
+    page_title="Phân Tích Dữ Liệu Báo Cáo Tài Chính Việt Nam",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- KHAI BÁO CÁC CHỈ SỐ KINH TẾ VĨ MÔ VÀ TÊN HIỂN THỊ ---
-INDICATOR_MAP = {
-    'NY.GDP.MKTP.KD.ZG': 'Tăng trưởng GDP (năm %)',
-    'FP.CPI.TOTL.ZG': 'Lạm phát (giá tiêu dùng, năm %)',
-    'SL.UEM.TOTL.ZS': 'Tỷ lệ thất nghiệp (tổng % lực lượng LĐ)',
-    'NE.EXP.GNFS.ZS': 'Xuất khẩu Hàng hóa & DV (% GDP)',
-    'NE.IMP.GNFS.ZS': 'Nhập khẩu Hàng hóa & DV (% GDP)',
-    'GC.DOD.TOTL.GD.ZS': 'Nợ Chính phủ Trung ương (tổng % GDP)',
-    'BX.KLT.DINV.CD.WD': 'FDI ròng vào (Triệu USD)',
-    'SP.POP.TOTL': 'Dân số (người)',
-    'NY.GDP.PCAP.CD': 'GDP bình quân đầu người (USD hiện tại)',
-    'NY.GDP.MKTP.CD': 'GDP (USD hiện tại) - Dùng tính tỷ trọng FDI'
+# --- KHAI BÁO CÁC MÃ CỔ PHIẾU VÀ LOẠI BÁO CÁO ---
+DEFAULT_STOCKS = ["VNM", "FPT", "HPG", "SSI", "VIC"]
+REPORT_TYPES = {
+    'balance_sheet': 'Bảng Cân đối Kế toán',
+    'income_statement': 'Báo cáo Kết quả Kinh doanh',
+    'cash_flow': 'Báo cáo Lưu chuyển Tiền tệ'
 }
+PERIOD_OPTIONS = {
+    'year': 'Theo Năm',
+    'quarter': 'Theo Quý'
+}
+SOURCE_DEFAULT = 'TCBS'
 
-COUNTRY_CODE = 'VNM'
 
-# --- HÀM TẢI DỮ LIỆU TỪ WORLDBANK (ĐÃ SỬA) ---
-@st.cache_data(show_spinner="Đang trích xuất dữ liệu từ World Bank...")
-def get_worldbank_data(indicators, country, start_year, end_year):
+# --- HÀM TẢI DỮ LIỆU TÀI CHÍNH TỪ VNSTOCK ---
+@st.cache_data(show_spinner="Đang trích xuất dữ liệu Báo cáo Tài chính...")
+def get_financial_data(symbol, period='year', source=SOURCE_DEFAULT):
     """
-    Tải dữ liệu từ World Bank Data API sử dụng pandas_datareader.wb.download.
+    Tải Bảng Cân đối Kế toán, Báo cáo KQKD, và Báo cáo Lưu chuyển Tiền tệ
+    cho một mã cổ phiếu sử dụng Vnstock.
     """
-    if not indicators:
-        return pd.DataFrame()
-
-    try:
-        fdi_code = 'BX.KLT.DINV.CD.WD'
-        gdp_code = 'NY.GDP.MKTP.CD'
-        
-        # Chuẩn bị danh sách indicators
-        indicators_to_fetch = list(set(indicators))
-        if fdi_code in indicators:
-            indicators_to_fetch.append(gdp_code)
-            indicators_to_fetch = list(set(indicators_to_fetch))
-
-        # Lấy dữ liệu từ World Bank
-        data = wb.download(
-            indicator=indicators_to_fetch, 
-            country=country, 
-            start=start_year,
-            end=end_year
-        )
-        
-        # Xử lý dữ liệu
-        df = data.reset_index()
-        df = df.rename(columns={'year': 'Year', 'country': 'Country'})
-        
-        # Chuyển đổi năm sang số nguyên
-        df['Year'] = pd.to_numeric(df['Year'], errors='coerce').astype(int)
-        
-        # Tính FDI (% GDP) nếu cần
-        if fdi_code in indicators and gdp_code in df.columns:
-            df[gdp_code] = pd.to_numeric(df[gdp_code], errors='coerce')
-            df[fdi_code] = pd.to_numeric(df[fdi_code], errors='coerce')
-            
-            gdp_series = df[gdp_code].replace(0, np.nan)
-            df['FDI net inflows (% GDP)'] = (df[fdi_code] / gdp_series) * 100
-            
-            df = df.drop(columns=[fdi_code, gdp_code], errors='ignore')
-
-        # Đổi tên các cột
-        final_col_names = ['Year']
-        for code in indicators:
-            if code == fdi_code:
-                final_col_names.append('FDI net inflows (% GDP)')
-            elif code in INDICATOR_MAP:
-                final_col_names.append(INDICATOR_MAP[code])
-
-        df.columns = [INDICATOR_MAP.get(col, col) for col in df.columns]
-        
-        # Lọc và sắp xếp
-        available_cols = [col for col in final_col_names if col in df.columns]
-        df_final = df[available_cols].sort_values(by='Year', ascending=True)
-
-        return df_final
+    st.info(f"Đang tải dữ liệu tài chính cho mã **{symbol}** (Nguồn: VCI, Kỳ: {period})...")
+    financial_data = {}
     
-    except Exception as e:
-        st.error(f"Lỗi khi tải dữ liệu từ World Bank: {e}")
-        return pd.DataFrame()
+    try:
+        stock_api = Vnstock().stock(symbol=symbol, source=source)
+        
+        financial_data['balance_sheet'] = stock_api.finance.balance_sheet(period=period)
+        financial_data['income_statement'] = stock_api.finance.income_statement(period=period)
+        financial_data['cash_flow'] = stock_api.finance.cash_flow(period=period)
 
-# --- HÀM TÍNH TOÁN THỐNG KÊ MÔ TẢ ---
-def calculate_descriptive_stats(df):
-    """Tính toán thống kê mô tả chi tiết cho từng chỉ số."""
+        st.success(f"Tải dữ liệu thành công cho **{symbol}**.")
+        return financial_data
+        
+    except Exception as e:
+        st.error(f"Lỗi khi tải dữ liệu cho **{symbol}**: {e}")
+        st.warning("Vui lòng kiểm tra lại mã cổ phiếu và đảm bảo API nguồn dữ liệu đang hoạt động.")
+        return None
+
+# --- HÀM HỖ TRỢ TẠO FILE EXCEL ---
+@st.cache_data
+def to_excel(df_to_save, name):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        sheet_name = name.replace(' ', '_').replace('/', '_').strip()[:30]
+        df_to_save.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
+
+# --- HÀM TÍNH TOÁN THỐNG KÊ MÔ TẢ (CHO TÀI CHÍNH) ---
+def calculate_descriptive_stats(df, report_name):
+    """Tính toán thống kê mô tả chi tiết cho các chỉ số tài chính."""
     stats_list = []
-    numeric_cols = [col for col in df.columns if is_numeric_dtype(df[col])]
+    
+    df_temp = df.copy()
+    if df_temp.index.names is not None and len(df_temp.index.names) > 0:
+        df_temp = df_temp.reset_index(drop=False)
+
+    numeric_cols = [col for col in df_temp.columns if is_numeric_dtype(df_temp[col])]
+    
+    # Tìm cột thời gian linh hoạt
+    time_col = 'id'
+    if 'id' not in df_temp.columns:
+        if 'ReportDate' in df_temp.columns:
+            time_col = 'ReportDate'
+        elif 'Period' in df_temp.columns:
+            time_col = 'Period'
+        else:
+            time_col = df_temp.columns[0] # Dự phòng
 
     for col in numeric_cols:
-        series = df[col].dropna()
+        series = df_temp[col].dropna()
         if series.empty:
             stats_list.append({
                 'Chỉ tiêu': col, 'Trung bình (Mean)': 'N/A', 'Độ lệch chuẩn (Std Dev)': 'N/A', 
-                'Giá trị nhỏ nhất (Min)': 'N/A', 'Năm Min': 'N/A',
-                'Giá trị lớn nhất (Max)': 'N/A', 'Năm Max': 'N/A',
-                'Trung vị (Median)': 'N/A', 'Tứ phân vị Q1': 'N/A', 
-                'Tứ phân vị Q3': 'N/A', 'Hệ số biến thiên (CV, %)' : 'N/A'
+                'Giá trị nhỏ nhất (Min)': 'N/A', 'Kỳ Min': 'N/A',
+                'Giá trị lớn nhất (Max)': 'N/A', 'Kỳ Max': 'N/A',
+                'Trung vị (Median)': 'N/A', 'Hệ số biến thiên (CV, %)' : 'N/A'
             })
             continue
 
@@ -119,59 +124,57 @@ def calculate_descriptive_stats(df):
         min_val = series.min()
         max_val = series.max()
         median_val = series.median()
-        q1_val = series.quantile(0.25)
-        q3_val = series.quantile(0.75)
         cv = (std_val / mean_val) * 100 if mean_val != 0 else np.nan
 
         try:
-            year_min = df.loc[df[col] == min_val, 'Year'].iloc[0]
-        except:
-            year_min = 'N/A'
+            df_sorted = df_temp.sort_values(by=time_col)
             
-        try:
-            year_max = df.loc[df[col] == max_val, 'Year'].iloc[0]
-        except:
-            year_max = 'N/A'
+            period_min = df_sorted.loc[df_sorted[col] == min_val, time_col].iloc[0]
+            period_max = df_sorted.loc[df_sorted[col] == max_val, time_col].iloc[0]
+        except Exception:
+            period_min, period_max = 'N/A', 'N/A'
 
         stats_list.append({
             'Chỉ tiêu': col,
-            'Trung bình (Mean)': f"{mean_val:,.2f}",
-            'Độ lệch chuẩn (Std Dev)': f"{std_val:,.2f}",
-            'Giá trị nhỏ nhất (Min)': f"{min_val:,.2f}",
-            'Năm Min': year_min,
-            'Giá trị lớn nhất (Max)': f"{max_val:,.2f}",
-            'Năm Max': year_max,
-            'Trung vị (Median)': f"{median_val:,.2f}",
-            'Tứ phân vị Q1': f"{q1_val:,.2f}",
-            'Tứ phân vị Q3': f"{q3_val:,.2f}",
+            'Trung bình (Mean)': f"{mean_val:,.0f}", 
+            'Độ lệch chuẩn (Std Dev)': f"{std_val:,.0f}",
+            'Giá trị nhỏ nhất (Min)': f"{min_val:,.0f}",
+            'Kỳ Min': period_min,
+            'Giá trị lớn nhất (Max)': f"{max_val:,.0f}",
+            'Kỳ Max': period_max,
+            'Trung vị (Median)': f"{median_val:,.0f}",
             'Hệ số biến thiên (CV, %)': f"{cv:,.2f}%" if not np.isnan(cv) else 'N/A'
         })
 
     return pd.DataFrame(stats_list)
 
 # --- HÀM GỌI API GEMINI ---
-def get_ai_analysis(stats_df, country, start_year, end_year, api_key):
-    """Gửi bảng thống kê đến Gemini để phân tích."""
+def get_ai_analysis(stats_df_income, stats_df_balance, symbol, period, api_key):
+    """Gửi bảng thống kê đến Gemini để phân tích Báo cáo Tài chính."""
     try:
         client = genai.Client(api_key=api_key)
         model_name = 'gemini-2.5-flash'
         
-        stats_markdown = stats_df.to_markdown(index=False)
+        income_markdown = stats_df_income.to_markdown(index=False)
+        balance_markdown = stats_df_balance.to_markdown(index=False)
 
         prompt = f"""
-        Bạn là một Chuyên gia Kinh tế Vĩ mô và Phân tích Thị trường Tài chính hàng đầu. 
-        Nhiệm vụ của bạn là phân tích tình hình kinh tế của {country} trong giai đoạn từ năm {start_year} đến năm {end_year}.
+        Bạn là một Chuyên gia Phân tích Tài chính hàng đầu. Nhiệm vụ của bạn là phân tích tình hình kinh doanh và sức khỏe tài chính của công ty {symbol} dựa trên dữ liệu báo cáo tài chính {period} (theo Năm/Quý) trong giai đoạn đã được cung cấp.
 
-        Dưới đây là Bảng Thống kê Mô tả chi tiết cho các chỉ số kinh tế vĩ mô quan trọng:
-        {stats_markdown}
+        Dưới đây là Bảng Thống kê Mô tả cho các chỉ tiêu quan trọng:
 
-        Dựa trên bảng thống kê trên và các chỉ số sau (Trung bình, Độ lệch chuẩn, Hệ số biến thiên):
-        1.  **Đánh giá Tốc độ Tăng trưởng và Ổn định Kinh tế (dựa trên GDP Growth, Lạm phát, Thất nghiệp)**. 
-            Độ lệch chuẩn và Hệ số biến thiên cao cho thấy sự bất ổn.
-        2.  **Đánh giá Cán cân Đối ngoại (dựa trên Xuất/Nhập khẩu và FDI)**.
-        3.  **Đánh giá Sức khỏe Tài khóa (dựa trên Nợ Chính phủ)**.
+        ### Bảng 1: Thống kê Báo cáo Kết quả Kinh doanh (Tập trung vào Hiệu suất)
+        {income_markdown}
 
-        Hãy viết một báo cáo phân tích tổng hợp (khoảng 3-5 đoạn) bằng tiếng Việt, tập trung vào xu hướng, mức độ ổn định và so sánh các chỉ số quan trọng trong giai đoạn này.
+        ### Bảng 2: Thống kê Bảng Cân đối Kế toán (Tập trung vào Cấu trúc Tài sản & Nguồn vốn)
+        {balance_markdown}
+        
+        Dựa trên hai bảng thống kê trên, hãy viết một báo cáo phân tích tổng hợp (khoảng 4-6 đoạn) bằng tiếng Việt.
+        1.  **Đánh giá Tăng trưởng & Ổn định Doanh thu/Lợi nhuận:** Phân tích Trung bình, Tối đa/Tối thiểu, và đặc biệt là **Hệ số biến thiên (CV)** của Doanh thu/Lợi nhuận. CV cao cho thấy sự bất ổn trong hoạt động kinh doanh.
+        2.  **Đánh giá Cấu trúc Tài sản & Nợ:** Phân tích xu hướng Tổng tài sản, Nợ phải trả và Vốn chủ sở hữu. Nhận xét về rủi ro tài chính (tỷ trọng nợ).
+        3.  **Nhận xét Khác:** Tổng hợp các điểm mạnh, điểm yếu nổi bật trong giai đoạn phân tích.
+        
+        Hãy trình bày báo cáo một cách chuyên nghiệp, dễ đọc và tập trung vào các con số quan trọng.
         """
 
         response = client.models.generate_content(
@@ -185,187 +188,165 @@ def get_ai_analysis(stats_df, country, start_year, end_year, api_key):
     except Exception as e:
         return f"Đã xảy ra lỗi không xác định: {e}"
 
-# --- GIAO DIỆN STREAMLIT ---
+
+# --- 4. GIAO DIỆN STREAMLIT CHÍNH ---
+st.title("📈 Phân Tích Báo Cáo Tài Chính Cổ Phiếu Việt Nam")
+st.markdown("Sử dụng thư viện **`vnstock`** để trích xuất dữ liệu tài chính.")
+
 st.sidebar.header("Tùy Chọn Dữ Liệu")
-st.sidebar.markdown(f"**Quốc gia:** Việt Nam ({COUNTRY_CODE})")
-st.sidebar.info("Ứng dụng hiện chỉ tập trung vào dữ liệu Việt Nam từ World Bank.")
 
-col_start, col_end = st.sidebar.columns(2)
-CURRENT_YEAR = pd.Timestamp('now').year
-START_YEAR_DEFAULT = 2000
+symbol = st.sidebar.text_input(
+    "Nhập Mã Cổ Phiếu (ví dụ: VNM, HPG)",
+    value=DEFAULT_STOCKS[0]
+).upper()
 
-with col_start:
-    start_year = st.number_input("Năm Bắt Đầu", min_value=1960, max_value=CURRENT_YEAR, value=START_YEAR_DEFAULT)
-with col_end:
-    end_year = st.number_input("Năm Kết Thúc", min_value=1960, max_value=CURRENT_YEAR, value=CURRENT_YEAR)
-
-if start_year > end_year:
-    st.sidebar.error("Năm bắt đầu phải nhỏ hơn hoặc bằng năm kết thúc.")
-
-INDICATOR_OPTIONS = {name: code for code, name in INDICATOR_MAP.items() if code != 'NY.GDP.MKTP.CD'}
-
-selected_indicators_names = st.sidebar.multiselect(
-    "Chọn các Chỉ số Kinh tế cần trích xuất:",
-    options=list(INDICATOR_OPTIONS.keys()),
-    default=list(INDICATOR_OPTIONS.keys())[:5]
+period = st.sidebar.radio(
+    "Chọn Kỳ Báo Cáo:",
+    options=list(PERIOD_OPTIONS.keys()),
+    format_func=lambda x: PERIOD_OPTIONS[x],
+    index=0
 )
 
-selected_ids = [INDICATOR_OPTIONS[name] for name in selected_indicators_names]
+# Thêm Khóa API cho AI
+st.sidebar.header("Cấu hình AI (Tùy chọn)")
+api_key = st.sidebar.text_input("Nhập GEMINI_API_KEY", type="password")
+st.sidebar.caption("Sử dụng Khóa API của bạn để kích hoạt Phân tích AI.")
 
-# --- CHỨC NĂNG CHÍNH ---
-if selected_ids and start_year <= end_year:
-    df_data = get_worldbank_data(selected_ids, COUNTRY_CODE, start_year, end_year)
 
-    if not df_data.empty:
-        missing_count = df_data.isnull().sum().sum()
-        if missing_count > 0:
-            st.warning(f"Cảnh báo: Phát hiện **{missing_count}** giá trị thiếu (Missing Data).")
-            df_filled = df_data.ffill().bfill()
-            
-            df_display = df_filled.copy()
-            for col in df_display.columns:
-                 if is_numeric_dtype(df_display[col]):
-                    df_display[col] = df_display[col].replace([np.inf, -np.inf, np.nan], 'N/A')
-            
-            st.info("Giá trị thiếu đã được xử lý tự động bằng phương pháp **điền giá trị gần nhất**.")
-            
-        else:
-            df_filled = df_data
-            df_display = df_data.replace([np.inf, -np.inf, np.nan], 'N/A')
+if symbol:
+    
+    financial_data = get_financial_data(symbol, period=period, source=SOURCE_DEFAULT)
 
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "1. Bảng Dữ liệu & Tải về", 
-            "2. Biểu đồ Trực quan", 
-            "3. Thống kê Mô tả",
-            "4. Phân tích AI Tổng hợp"
-        ])
+    if financial_data:
         
-        with tab1:
-            st.subheader("Bảng Tổng hợp Dữ liệu Kinh tế Vĩ mô")
-            st.dataframe(df_display, use_container_width=True, height=500)
+        # --- TAB HIỂN THỊ DỮ LIỆU ---
+        tab_names = [f"{i+1}. {REPORT_TYPES[key]}" for i, key in enumerate(REPORT_TYPES.keys())]
+        tab_names.extend(["4. Thống kê Mô tả", "5. Trực quan hóa", "6. Phân tích AI"])
+        
+        tabs = st.tabs(tab_names)
+        
+        stats_dfs = {}
 
-            @st.cache_data
-            def to_excel(df):
-                output = BytesIO()
-                df_to_save = df.replace('N/A', np.nan) 
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_to_save.to_excel(writer, index=False, sheet_name='Du_lieu_WorldBank')
-                return output.getvalue()
+        report_keys = list(REPORT_TYPES.keys())
+        for i, key in enumerate(report_keys):
+            name = REPORT_TYPES[key]
+            with tabs[i]:
+                st.subheader(f"{name} của {symbol} (Kỳ: {PERIOD_OPTIONS[period]})")
+                
+                df = financial_data[key].copy() 
+                
+                if df is not None and not df.empty:
+                    if df.index.names is not None and len(df.index.names) > 0:
+                        df = df.reset_index(drop=False)
+                        
+                    # Sắp xếp hiển thị
+                    sort_col = 'id' if 'id' in df.columns else ('ReportDate' if 'ReportDate' in df.columns else df.columns[0])
+                    
+                    df_display = df.sort_values(by=sort_col, ascending=False).reset_index(drop=True)
 
-            excel_data = to_excel(df_filled)
-            st.download_button(
-                label="📥 Tải Dữ liệu về File Excel (.xlsx)",
-                data=excel_data,
-                file_name=f'worldbank_data_{COUNTRY_CODE}_{start_year}-{end_year}.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
+                    st.dataframe(df_display, use_container_width=True)
 
-        with tab2:
-            st.subheader("Trực quan hóa Xu hướng Biến động theo Thời gian")
+                    stats_dfs[key] = calculate_descriptive_stats(df, name)
 
-            chart_type = st.radio(
-                "Chọn Loại Biểu Đồ Chính:",
-                ('Biểu đồ Đường (Line Chart)', 'Biểu đồ Cột (Bar Chart)', 'Phân tích Tương quan (Scatter/Heatmap)')
-            )
-
-            chart_cols = [col for col in df_filled.columns if col != 'Year']
-            
-            if not chart_cols:
-                st.warning("Không có cột dữ liệu hợp lệ để vẽ biểu đồ.")
-            else:
-                if chart_type in ('Biểu đồ Đường (Line Chart)', 'Biểu đồ Cột (Bar Chart)'):
-                    selected_chart_indicators = st.multiselect(
-                        "Chọn các chỉ số để hiển thị trên biểu đồ:",
-                        options=chart_cols,
-                        default=chart_cols[:min(len(chart_cols), 3)]
+                    excel_data = to_excel(df_display, name)
+                    st.download_button(
+                        label=f"📥 Tải {name} về Excel (.xlsx)",
+                        data=excel_data,
+                        file_name=f'{symbol}_{key}_{period}.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        key=f'download_{key}'
                     )
 
-                    if selected_chart_indicators:
-                        fig, ax = plt.subplots(figsize=(12, 6))
-                        color_palette = sns.color_palette("viridis", len(selected_chart_indicators))
+                else:
+                    st.warning(f"Không tìm thấy hoặc dữ liệu {name} bị trống cho mã **{symbol}**.")
 
-                        for i, indicator in enumerate(selected_chart_indicators):
-                            if chart_type == 'Biểu đồ Đường (Line Chart)':
-                                ax.plot(df_filled['Year'], df_filled[indicator], marker='o', label=indicator)
-                            elif chart_type == 'Biểu đồ Cột (Bar Chart)':
-                                sns.barplot(x=df_filled['Year'], y=df_filled[indicator], ax=ax, label=indicator, color=color_palette[i])
-                                
-                        ax.set_title(f"Xu hướng Biến động của các Chỉ số ({start_year}-{end_year})", fontsize=16)
-                        ax.set_xlabel("Năm", fontsize=12)
-                        ax.set_ylabel("Giá trị", fontsize=12)
-                        ax.legend(loc='best')
-                        ax.grid(True, linestyle='--', alpha=0.6)
-                        plt.xticks(df_filled['Year'].unique(), rotation=45, ha='right')
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                        
-                elif chart_type == 'Phân tích Tương quan (Scatter/Heatmap)':
-                    corr_method = st.radio("Chọn Phương pháp Tương quan:", ('Biểu đồ Phân tán (Scatter Plot)', 'Biểu đồ Nhiệt Ma trận Tương quan (Heatmap)'))
-                    
-                    if corr_method == 'Biểu đồ Phân tán (Scatter Plot)':
-                        col_x, col_y = st.columns(2)
-                        with col_x:
-                            indicator_x = st.selectbox("Chọn Chỉ số cho Trục X:", options=chart_cols, index=0)
-                        with col_y:
-                            indicator_y = st.selectbox("Chọn Chỉ số cho Trục Y:", options=chart_cols, index=min(len(chart_cols)-1, 1))
-
-                        if indicator_x and indicator_y:
-                            fig, ax = plt.subplots(figsize=(10, 6))
-                            ax.scatter(df_filled[indicator_x], df_filled[indicator_y])
-                            
-                            for i, row in df_filled.iterrows():
-                                ax.annotate(row['Year'], (row[indicator_x], row[indicator_y]), textcoords="offset points", xytext=(0,5), ha='center')
-                                
-                            ax.set_title(f"Mối tương quan: {indicator_x} vs {indicator_y}", fontsize=16)
-                            ax.set_xlabel(indicator_x, fontsize=12)
-                            ax.set_ylabel(indicator_y, fontsize=12)
-                            ax.grid(True, linestyle='--', alpha=0.6)
-                            st.pyplot(fig)
-
-                    elif corr_method == 'Biểu đồ Nhiệt Ma trận Tương quan (Heatmap)':
-                        corr_matrix = df_filled[chart_cols].corr(method='pearson')
-                        fig, ax = plt.subplots(figsize=(10, 8))
-                        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", linewidths=.5, cbar_kws={'label': 'Hệ số tương quan'})
-                        ax.set_title("Ma trận Tương quan giữa các Chỉ số", fontsize=16)
-                        plt.tight_layout()
-                        st.pyplot(fig)
-
-        with tab3:
-            st.subheader(f"Thống kê Mô tả Giai đoạn {start_year} - {end_year}")
-            stats_df = calculate_descriptive_stats(df_filled)
-            st.dataframe(stats_df, use_container_width=True)
+        # --- TAB THỐNG KÊ MÔ TẢ ---
+        with tabs[3]: 
+            st.subheader(f"Thống kê Mô tả Báo cáo Tài chính {symbol}")
             
+            if stats_dfs:
+                for key, df_stats in stats_dfs.items():
+                    st.markdown(f"### {REPORT_TYPES[key]}")
+                    st.dataframe(df_stats, use_container_width=True)
+            else:
+                st.info("Không có dữ liệu thống kê để hiển thị.")
+                
             st.caption("""
             **Giải thích:** **Độ lệch chuẩn** và **Hệ số biến thiên** (CV) càng cao cho thấy mức độ biến động/bất ổn của chỉ số trong giai đoạn càng lớn.
+            Giá trị được làm tròn.
             """)
 
-        with tab4:
-            st.subheader("Phân tích Chuyên sâu từ Gemini AI")
-            st.markdown("Chức năng này sử dụng Bảng Thống kê (Tab 3) và các biểu đồ trực quan (Tab 2) làm cơ sở để AI phân tích tình hình kinh tế tổng thể của Việt Nam.")
-            
-            try:
-                api_key = st.secrets["GEMINI_API_KEY"]
-            except KeyError:
-                api_key = None
-                st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets.")
+        # --- TAB TRỰC QUAN HÓA ---
+        with tabs[4]: 
+            st.subheader("📊 Trực quan hóa Xu hướng Quan trọng (Báo cáo KQKD)")
 
-            if api_key:
-                if st.button("🌟 Yêu cầu AI Phân tích Tổng hợp"):
+            if 'income_statement' in financial_data:
+                df_income = financial_data['income_statement'].copy()
+                
+                if df_income.index.names is not None and len(df_income.index.names) > 0:
+                    df_income = df_income.reset_index(drop=False) 
+
+                numeric_cols = df_income.select_dtypes(include=np.number).columns.tolist()
+                
+                default_metrics = ['NetProfit', 'Revenue', 'GrossProfit']
+                chart_cols = [col for col in default_metrics if col in numeric_cols]
+                chart_cols.extend([col for col in numeric_cols if col not in chart_cols])
+                
+                # Sửa lỗi: Tìm cột thời gian linh hoạt
+                time_col_for_chart = 'period'
+
+                if chart_cols and time_col_for_chart:
+                    selected_metric = st.selectbox(
+                        "Chọn chỉ tiêu cần trực quan hóa từ Báo cáo KQKD:",
+                        options=chart_cols,
+                        index=chart_cols.index('NetProfit') if 'NetProfit' in chart_cols else 0
+                    )
+                    
+                    df_chart = df_income[[time_col_for_chart, selected_metric]].dropna()
+                    
+                    if not df_chart.empty:
+                        df_chart = df_chart.sort_values(by=time_col_for_chart, ascending=True)
+
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        sns.barplot(x=df_chart[time_col_for_chart], y=df_chart[selected_metric], ax=ax, palette='viridis') 
+
+                        ax.set_title(f"Xu hướng {selected_metric} của {symbol} ({PERIOD_OPTIONS[period]})", fontsize=16)
+                        ax.set_xlabel("Kỳ Báo Cáo", fontsize=12)
+                        ax.set_ylabel(selected_metric, fontsize=12)
+                        ax.ticklabel_format(style='plain', axis='y')
+                        ax.grid(axis='y', linestyle='--', alpha=0.6)
+                        plt.xticks(rotation=45, ha='right')
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                    else:
+                        st.warning(f"Không có dữ liệu hợp lệ cho chỉ tiêu '{selected_metric}' để vẽ biểu đồ.")
+                else:
+                    st.warning("Không tìm thấy đủ dữ liệu (cột số hoặc cột thời gian) trong Báo cáo KQKD để trực quan hóa. Vui lòng kiểm tra cấu trúc dữ liệu.")
+
+        # --- TAB PHÂN TÍCH AI TỔNG HỢP ---
+        with tabs[5]: 
+            st.subheader("Phân tích Chuyên sâu từ Gemini AI")
+            st.markdown("Chức năng này sử dụng Bảng Thống kê (Tab 4) làm cơ sở để AI phân tích tình hình tài chính tổng thể của công ty.")
+            
+            if not api_key:
+                st.error("Vui lòng nhập **GEMINI_API_KEY** vào Sidebar để kích hoạt chức năng này.")
+            
+            elif 'income_statement' not in stats_dfs or 'balance_sheet' not in stats_dfs:
+                st.warning("Thiếu dữ liệu (KQKD hoặc Bảng Cân đối Kế toán) để tiến hành phân tích AI.")
+
+            else:
+                if st.button("🌟 Yêu cầu AI Phân tích Tổng hợp Báo cáo Tài chính"):
                     with st.spinner('Đang gửi dữ liệu thống kê và chờ Gemini phân tích...'):
-                        stats_df_for_ai = calculate_descriptive_stats(df_filled)
                         
                         ai_result = get_ai_analysis(
-                            stats_df_for_ai, 
-                            "Việt Nam", 
-                            start_year, 
-                            end_year, 
+                            stats_dfs['income_statement'], 
+                            stats_dfs['balance_sheet'], 
+                            symbol, 
+                            PERIOD_OPTIONS[period], 
                             api_key
                         )
                         st.markdown("**Kết quả Phân tích từ Gemini AI:**")
                         st.info(ai_result)
-
-    else:
-        st.warning("Không có dữ liệu được tải về cho các chỉ số và khoảng thời gian đã chọn. Vui lòng kiểm tra lại tùy chọn.")
-
+                
 else:
-    st.info("Vui lòng chọn ít nhất một Chỉ số và đảm bảo khoảng thời gian hợp lệ.")
+    st.info("Vui lòng nhập Mã Cổ Phiếu để bắt đầu.")
